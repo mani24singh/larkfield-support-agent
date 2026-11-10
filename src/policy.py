@@ -27,6 +27,7 @@ from src.ingest import (
     RefundRecord,
     ShipmentRecord,
     normalise_order_id,
+    parse_timestamp,
 )
 from src.money import quantize_money
 from src.models import (
@@ -36,6 +37,7 @@ from src.models import (
     CheckResult,
     Evidence,
     Outcome,
+    Ticket,
     TicketType,
 )
 
@@ -120,13 +122,28 @@ _OVERRIDE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "system_override",
         re.compile(
             r"\b(?:system|developer|admin|internal)\s*(?:prompt|override|instruction)\b"
-            r"|\bignore (?:all|any|the) (?:previous|prior|above) (?:instructions?|rules?)\b",
+            r"|\bignore (?:all|any|the|your) (?:previous|prior|above) (?:instructions?|rules?)\b"
+            r"|\bnote to the (?:ai|assistant|agent|system)\b"
+            r"|\[system\]",
             re.IGNORECASE,
         ),
     ),
     (
         "role_change",
-        re.compile(r"\byou are now\b|\bpretend (?:that )?you(?: are)?\b", re.IGNORECASE),
+        re.compile(
+            r"\byou are now\b|\bpretend (?:that )?you(?: are)?\b"
+            r"|\b(?:you are|you're)\s+(?:now\s+)?(?:authorised|authorized|permitted|allowed)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "limit_override",
+        re.compile(
+            r"\b(?:above|over|beyond|regardless of|ignoring)\s+(?:any|the|all|your)?\s*"
+            r"(?:limits?|thresholds?|policy|policies)\b"
+            r"|\bwithout (?:any )?(?:review|approval|checks?)\b",
+            re.IGNORECASE,
+        ),
     ),
     ("pre_approval", re.compile(r"\bpre[-\s]?approved\b|\balready approved\b", re.IGNORECASE)),
     ("chargeback", re.compile(r"\bcharge\s?back\b|\bchargeback\b", re.IGNORECASE)),
@@ -383,10 +400,9 @@ def evaluate_carrier(
     status = shipment.status.strip().upper()
     delivered_at = shipment.delivered_at
     last_event = shipment.last_event_at
-    last_scan = max(
-        [value for value in (last_event, shipment.shipped_at) if value is not None],
-        default=None,
-    )
+    # Prefer the carrier's latest scan. Falling back to shipped_at only when the
+    # feed is empty; a scan older than shipped_at still means the feed is stale.
+    last_scan = last_event if last_event is not None else shipment.shipped_at
     last_scan = _as_utc(last_scan) if last_scan is not None else None
 
     evidence: list[Evidence] = [
@@ -1252,6 +1268,151 @@ def _ordered_checks(checks: Sequence[Check]) -> tuple[Check, ...]:
         if check.check_id not in known:
             raise ValueError(f"unknown check_id: {check.check_id}")
     return tuple(sorted(checks, key=lambda check: known[check.check_id]))
+
+
+def adjudicate_ticket(
+    dataset: Dataset,
+    ticket: Ticket,
+    *,
+    settings: Settings | None = None,
+) -> Decision:
+    """Run the ordered gates for one ticket and return the decision.
+
+    The order is fixed: safety, identity, carrier, window, then the refund
+    money/authority gates. Non-refund ticket types stop at a status answer.
+    """
+    config = settings or Settings()
+    text = f"{ticket.subject}\n{ticket.body}"
+    received_at = parse_timestamp(ticket.received_at)
+    if received_at is None:
+        raise ValueError(f"ticket {ticket.ticket_id} has no usable received_at")
+
+    override = detect_policy_override(text)
+    identity = resolve_identity(
+        dataset, email=ticket.from_, order_reference=normalise_order_id(text)
+    )
+    ticket_type = classify_ticket(subject=ticket.subject, body=ticket.body)
+    damage = assess_damage(text, ticket.attachments)
+
+    order = identity.order
+    shipment = (
+        dataset.shipment_for_order(order.order_id) if order is not None else None
+    )
+    carrier = evaluate_carrier(shipment, now=received_at, settings=config)
+    window = evaluate_window(
+        delivered_at=carrier.delivered_at,
+        received_at=received_at,
+        damage=damage,
+        settings=config,
+        applies=ticket_type in {"REFUND", "RETURN"},
+    )
+    checks = _ordered_checks(
+        build_checks(
+            override_phrase=override,
+            identity=identity,
+            carrier=carrier,
+            window=window,
+            damage=damage,
+        )
+    )
+    zero = Decimal("0.00")
+
+    if override is not None:
+        return Decision(
+            outcome="ESCALATE",
+            reason_codes=(ReasonCode.POLICY_OVERRIDE_ATTEMPT,),
+            checks=checks,
+            amount=zero,
+            approver_role="TRUST_SAFETY",
+            human_approval_required=True,
+        )
+
+    if not identity.order_identified or not identity.owner_verified:
+        return Decision(
+            outcome="INVALID_REQUEST",
+            reason_codes=(
+                (identity.reason_code or ReasonCode.CUSTOMER_MISMATCH),
+            ),
+            checks=checks,
+            amount=zero,
+            approver_role=None,
+            human_approval_required=False,
+        )
+
+    if carrier.state is CarrierState.UNAVAILABLE:
+        return Decision(
+            outcome="UNABLE_TO_VERIFY",
+            reason_codes=(ReasonCode.CARRIER_STATUS_UNAVAILABLE,),
+            checks=checks,
+            amount=zero,
+            approver_role=None,
+            human_approval_required=False,
+        )
+
+    if carrier.is_lost:
+        return Decision(
+            outcome="ESCALATE",
+            reason_codes=(ReasonCode.LOST_IN_TRANSIT,),
+            checks=checks,
+            amount=zero,
+            approver_role="CARRIER_CLAIMS",
+            human_approval_required=True,
+        )
+
+    if ticket_type in {"ORDER_STATUS", "DELIVERY_ISSUE", "OTHER"}:
+        return Decision(
+            outcome="PROCEED",
+            reason_codes=(),
+            checks=checks,
+            amount=zero,
+            approver_role=None,
+            human_approval_required=False,
+        )
+
+    if window.state is WindowState.OUT_OF_WINDOW:
+        return Decision(
+            outcome="REJECT",
+            reason_codes=(ReasonCode.OUT_OF_WINDOW,),
+            checks=checks,
+            amount=zero,
+            approver_role=None,
+            human_approval_required=False,
+        )
+
+    if window.state is WindowState.UNABLE_TO_VERIFY:
+        return Decision(
+            outcome="UNABLE_TO_VERIFY",
+            reason_codes=(),
+            checks=checks,
+            amount=zero,
+            approver_role=None,
+            human_approval_required=False,
+        )
+
+    assert order is not None  # identity was verified above
+    decision = assess_refund(
+        order=order,
+        lines=dataset.order_lines(order.order_id),
+        refunds=dataset.issued_refunds(order.order_id),
+        body=text,
+        base_checks=checks,
+        settings=config,
+    )
+
+    if window.reason_code is ReasonCode.DAMAGE_EXCEPTION:
+        decision = Decision(
+            outcome=decision.outcome,
+            reason_codes=tuple(
+                dict.fromkeys((ReasonCode.DAMAGE_EXCEPTION, *decision.reason_codes))
+            ),
+            checks=decision.checks,
+            amount=decision.amount,
+            approver_role=decision.approver_role,
+            human_approval_required=decision.human_approval_required,
+        )
+
+    return decision
+
 
 
 def refundable_amount(
