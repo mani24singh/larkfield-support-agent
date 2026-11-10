@@ -48,6 +48,11 @@ class Settings(BaseModel):
     cadra_proxy_url: str = "https://proxy.cadra.info/v1"
     cadra_token: SecretStr = SecretStr("")
     cadra_model: str = "cadra/cadra"
+    cadra_timeout_seconds: float = 30.0
+    cadra_max_retries: int = Field(default=3, ge=0, le=10)
+    cadra_retry_backoff_seconds: float = 0.5
+    cadra_input_cost_per_mtok: Decimal = Decimal("0.00")
+    cadra_output_cost_per_mtok: Decimal = Decimal("0.00")
 
     # --- Repository tables -------------------------------------------
     customers_csv: Path | None = None
@@ -60,6 +65,16 @@ class Settings(BaseModel):
     def policy_document(self) -> Path:
         """Authoritative customer-care policy (RP-3.2)."""
         return self.policies_dir / "refund_policy_RP-3.2.md"
+
+    @property
+    def price_table(self) -> dict[str, tuple[Decimal, Decimal]]:
+        """Per-model price table: ``{model: (usd_per_mtok_in, usd_per_mtok_out)}``."""
+        return {
+            self.cadra_model: (
+                self.cadra_input_cost_per_mtok,
+                self.cadra_output_cost_per_mtok,
+            )
+        }
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -86,6 +101,10 @@ class Settings(BaseModel):
             raw = source.get(name, "").strip()
             return Decimal(raw) if raw else default
 
+        def number(name: str, default: float) -> float:
+            raw = source.get(name, "").strip()
+            return float(raw) if raw else default
+
         return cls(
             host=text("HOST", "0.0.0.0"),
             port=integer("PORT", 8000),
@@ -105,6 +124,15 @@ class Settings(BaseModel):
             cadra_proxy_url=text("CADRA_PROXY_URL", "https://proxy.cadra.info/v1"),
             cadra_token=SecretStr(source.get("CADRA_TOKEN", "").strip()),
             cadra_model=text("CADRA_MODEL", "cadra/cadra"),
+            cadra_timeout_seconds=number("CADRA_TIMEOUT_SECONDS", 30.0),
+            cadra_max_retries=integer("CADRA_MAX_RETRIES", 3),
+            cadra_retry_backoff_seconds=number("CADRA_RETRY_BACKOFF_SECONDS", 0.5),
+            cadra_input_cost_per_mtok=decimal(
+                "CADRA_INPUT_COST_PER_MTOK", Decimal("0.00")
+            ),
+            cadra_output_cost_per_mtok=decimal(
+                "CADRA_OUTPUT_COST_PER_MTOK", Decimal("0.00")
+            ),
             customers_csv=path("CUSTOMERS_CSV", _PROJECT_ROOT / "data" / "customers.csv"),
             orders_csv=path("ORDERS_CSV", _PROJECT_ROOT / "data" / "orders.csv"),
             order_items_csv=path("ORDER_ITEMS_CSV", _PROJECT_ROOT / "data" / "order_items.csv"),

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from src.api import create_app
 from src.config import Settings
@@ -26,7 +27,9 @@ BY_ID = {ticket["ticket_id"]: ticket for ticket in INBOX}
 
 @pytest.fixture()
 def client(tmp_path: Path) -> TestClient:
-    settings = Settings(runs_dir=tmp_path / "runs")
+    settings = Settings(
+        runs_dir=tmp_path / "runs", cadra_token=SecretStr("")
+    )
     return TestClient(create_app(settings))
 
 

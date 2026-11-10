@@ -17,6 +17,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, status
 from src.config import Settings, get_settings
 from src.ingest import Dataset
 from src.ledger import RunLedger
+from src.llm import CadraClient
 from src.models import Decision, LedgerEntry, Ticket, TicketResponse
 from src.pipeline import dataset_for, new_run_id, process_batch
 
@@ -36,6 +37,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = config
     app.state.runs = {}
     app.state.dataset = None
+    app.state.llm = (
+        CadraClient(config)
+        if config.cadra_token.get_secret_value().strip()
+        else None
+    )
 
     def dataset() -> Dataset:
         if app.state.dataset is None:
@@ -85,6 +91,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             dataset=dataset(),
             ledger=ledger,
             settings=config,
+            client=app.state.llm,
         )
         return [
             TicketResponse.model_validate(response.model_dump(mode="json"))
