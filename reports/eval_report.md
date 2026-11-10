@@ -1,8 +1,8 @@
 # Evaluation report
 
-Generated: 2026-11-10T17:21:08+00:00
-Run: `run_7a80571e0d904bfa8b7d00d7f799fd72` (replay `run_24e264321e7c417cbae17d9bd7a0674b`)
-Runtime: 0.59s
+Generated: 2026-11-10T17:40:13+00:00
+Run: `run_c865b012f0144f5595488f1dbfec7096` (replay `run_bbbb5c8061f34f1090fbb70795135ecc`)
+Runtime: 0.69s
 
 ## Headline metrics
 

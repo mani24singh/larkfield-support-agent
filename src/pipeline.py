@@ -41,9 +41,20 @@ from src.policy import (
     select_affected_lines,
 )
 from src.prompts import FALLBACK_TEMPLATES, build_reply_messages
-from src.tools import TOOL_NAMES
 
 POLICY_DOCUMENT = DocumentUsed(document="refund_policy_RP-3.2.md", version="3.2")
+
+DATA_ACCESS = (
+    "ingest.load_dataset",
+    "ingest.normalise_email",
+    "ingest.normalise_order_id",
+    "dataset.customer_by_email",
+    "dataset.order",
+    "dataset.order_lines",
+    "dataset.shipment_for_order",
+    "dataset.issued_refunds",
+)
+"""Data-access operations actually used; recorded as ``trace.tools_called``."""
 
 ACTIONABLE_OUTCOMES = frozenset({"PROCEED", "PROCEED_MODIFIED", "PEND"})
 NON_ACTIONABLE_OUTCOMES = frozenset(
@@ -400,7 +411,7 @@ def to_response(
         draft_reply=reply.draft,
         trace=Trace(
             model_calls=list(reply.model_calls),
-            tools_called=list(TOOL_NAMES),
+            tools_called=list(DATA_ACCESS),
             documents_used=[POLICY_DOCUMENT],
             cost_usd=reply.cost_usd,
         ),

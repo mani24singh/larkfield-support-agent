@@ -24,9 +24,10 @@ human decision where RP-3.2 requires one.
   parcels to Carrier Claims; treats unverifiable carrier statuses as
   unverifiable rather than as a denial.
 - Writes responses and ledger rows atomically under `runs/<run_id>/`.
-- Uses an OpenAI-compatible Cadra model **only** for advisory extraction and
-  reply wording. With no key configured it writes replies from deterministic
-  templates; either way the decision and money never change.
+- Reply drafting uses an OpenAI-compatible Cadra model when a key is configured;
+  an advisory extraction prompt is implemented but is deliberately not on the
+  decision path. With no key configured the service writes deterministic
+  templates, and either way the decision and money never change.
 
 ## Quick start
 
@@ -59,7 +60,7 @@ the per-million-token price table are all settable there.
 |---|---|---|
 | GET | `/health`, `/healthz` | Liveness: `{"status":"ok"}` |
 | POST | `/tickets` | One ticket object or a list; returns a list of `TicketResponse` |
-| GET | `/runs/{run_id}` | Responses and ledger for a run |
+| GET | `/runs/{run_id}` | A single-ticket run's response fields (plus its response list and ledger); add `?ticket_id=` for a batch |
 | POST | `/approvals` | Approve or reject a pending action |
 | POST | `/runs/{run_id}/decision` | Alias for `/approvals` with `run_id` in the path |
 | GET | `/ledger?run_id=` | Ledger entries for a run (all runs if omitted) |
@@ -81,10 +82,12 @@ curl -s -X POST localhost:8000/tickets \
   -d @inbox/public_tickets.json
 ```
 
-Inspect the run:
+Inspect the run (a single-ticket run returns the ticket's response fields; use
+`?ticket_id=` to pick one from a batch):
 
 ```bash
 curl -s localhost:8000/runs/<run_id>
+curl -s "localhost:8000/runs/<run_id>?ticket_id=<ticket_id>"
 curl -s "localhost:8000/ledger?run_id=<run_id>"
 ```
 

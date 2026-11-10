@@ -424,6 +424,19 @@ def test_client_refuses_to_estimate_tokens() -> None:
         cadra.complete([])
 
 
+def test_unconfigured_client_never_touches_the_network(monkeypatch) -> None:
+    def explode(*args, **kwargs):
+        raise AssertionError("network access attempted")
+
+    monkeypatch.setattr(httpx.Client, "post", explode)
+    cadra = CadraClient(
+        Settings(cadra_token=SecretStr(""), cadra_proxy_url="https://llm.example/v1")
+    )
+
+    with pytest.raises(LlmError, match="not configured"):
+        cadra.complete([])
+
+
 def test_json_parsing_tolerates_fences() -> None:
     assert extract_json_object('```json\n{"body": "hi"}\n```') == {"body": "hi"}
 

@@ -93,16 +93,19 @@ and the result cannot exceed the unpaid affected-line value. Thresholds are
 compared exactly, so $150.00 proceeds and $150.01 pends. The same inputs produce
 the same Decimal output; tests cover the boundary values and the caps.
 
-**What the model is allowed to do.** The extraction prompt returns advisory facts
-(order reference as written, product names, damage/wrong-item/non-delivery
-flags, claimed amounts, override quote). Those facts never set the canonical
-order id or any money. The reply prompt receives an already-decided outcome and
-can only write prose. Its output is post-validated: amount present if and only if
-the outcome is `PROCEED` or `PROCEED_MODIFIED`, every dollar figure equal to the
-decision amount, 90–160 words, first name present, fixed sign-off, no internal
-codes and no mention of AI or policy engines. Failures fall back to a template
-without changing the outcome. The email itself is always treated as untrusted
-data, both in the prompts and in the deterministic override detection.
+**What the model is allowed to do.** The extraction prompt and parser are
+implemented and tested, but the request path deliberately does not call them: the
+deterministic rules remain the only extractor in production. The extraction
+prompt returns advisory facts (order reference as written, product names,
+damage/wrong-item/non-delivery flags, claimed amounts, override quote). Those
+facts never set the canonical order id or any money. The reply prompt receives
+an already-decided outcome and can only write prose. Its output is
+post-validated: amount present if and only if the outcome is `PROCEED` or
+`PROCEED_MODIFIED`, every dollar figure equal to the decision amount, 90–160
+words, first name present, fixed sign-off, no internal codes and no mention of AI
+or policy engines. Failures fall back to a template without changing the
+outcome. The email itself is always treated as untrusted data, both in the
+prompts and in the deterministic override detection.
 
 **Idempotency, ledger and approvals.** A refund key is the normalised sender
 email, the canonical order id and the affected line. If a key already has a

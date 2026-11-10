@@ -99,10 +99,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
 
     @app.get("/runs/{run_id}", tags=["runs"])
-    def get_run(run_id: str) -> dict[str, Any]:
-        """Return every response and ledger entry for a run."""
+    def get_run(
+        run_id: str,
+        ticket_id: str | None = Query(
+            default=None, description="Return just this ticket's response"
+        ),
+    ) -> dict[str, Any]:
+        """Return a run in the contract's response shape.
+
+        A single-ticket run returns the ticket's ``TicketResponse`` fields at the
+        top level (with the full response list and ledger alongside). For a batch,
+        pass ``ticket_id`` to get one response, otherwise the batch envelope.
+        """
         ledger = ledger_or_404(run_id)
-        return {
+
+        if ticket_id is not None:
+            response = ledger.find_response(ticket_id)
+            if response is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"unknown ticket_id: {ticket_id}",
+                )
+            return response.model_dump(mode="json")
+
+        payload: dict[str, Any] = {
             "run_id": ledger.run_id,
             "responses": [
                 response.model_dump(mode="json") for response in ledger.responses
@@ -111,6 +131,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 entry.model_dump(mode="json") for entry in ledger.entries
             ],
         }
+        if len(ledger.responses) == 1:
+            payload = {**ledger.responses[0].model_dump(mode="json"), **payload}
+        return payload
 
     @app.get("/ledger", response_model=list[LedgerEntry], tags=["ledger"])
     def get_ledger(

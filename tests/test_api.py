@@ -121,7 +121,28 @@ def test_run_and_health_endpoints(client: TestClient) -> None:
     assert run.status_code == 200
     assert run.json()["run_id"] == run_id
     assert run.json()["responses"][0]["ticket_id"] == "T002"
+    # A single-ticket run also exposes the contract's run fields at top level.
+    assert run.json()["ticket_id"] == "T002"
+    assert run.json()["outcome"] == "PROCEED"
+    assert run.json()["draft_reply"]["subject"] == "Re: Damaged Arc floor lamp"
     assert client.get("/runs/does-not-exist").status_code == 404
+
+
+def test_batch_run_can_return_one_ticket_response(client: TestClient) -> None:
+    run_id, responses = _run_tickets(client, ["T002", "T003"])
+    batch = client.get(f"/runs/{run_id}").json()
+    single = client.get(
+        f"/runs/{run_id}", params={"ticket_id": "T003"}
+    )
+
+    assert "responses" in batch
+    assert single.status_code == 200
+    assert single.json()["ticket_id"] == "T003"
+    assert single.json()["outcome"] == responses["T003"]["outcome"]
+    assert single.json()["run_id"] == run_id
+    assert client.get(
+        f"/runs/{run_id}", params={"ticket_id": "missing"}
+    ).status_code == 404
 
 
 # ---------------------------------------------------------------------------
