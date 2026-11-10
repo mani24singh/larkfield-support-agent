@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
 
@@ -444,7 +444,8 @@ def evaluate_carrier(
             )
 
         stalled_days = (moment - last_scan).days
-        if stalled_days > config.lost_in_transit_days:
+        stalled = moment - last_scan
+        if stalled > timedelta(days=config.lost_in_transit_days):
             return CarrierEvaluation(
                 state=CarrierState.LOST,
                 days_since_last_scan=stalled_days,
@@ -456,7 +457,10 @@ def evaluate_carrier(
                         Evidence(
                             source="policy:RP-3.2",
                             ref="5.1",
-                            value=f"no scan for {stalled_days} days (> {config.lost_in_transit_days})",
+                            value=(
+                                f"no scan for {stalled} "
+                                f"(> {config.lost_in_transit_days} days)"
+                            ),
                         )
                     ]
                 ),
