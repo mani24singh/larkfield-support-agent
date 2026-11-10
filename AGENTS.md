@@ -198,7 +198,7 @@ Evaluate strictly top-down; the first blocking gate decides the outcome and late
 
 ## 7. Known repo quirks
 
-- `requirements.txt` is **UTF-16LE with CRLF**. If `pip install -r requirements.txt` fails to parse it, convert to UTF-8: `iconv -f UTF-16LE -t UTF-8 requirements.txt > requirements.utf8.txt`. Do not re-encode the file casually if others depend on it.
+- `requirements.txt` was re-encoded to **UTF-8** in the scaffold commit (the original export was UTF-16LE/CRLF). Keep it UTF-8; LF line endings are fine.
 - `orders.csv` has a space-containing column header (`Order Total`); access it by that exact name or rename in the loader and document it.
 - `shipments.status` can be `UNAVAILABLE` and `delivered_at` / `last_event_at` can be empty — the CSV is uncleaned; treat empties explicitly rather than relying on pandas Dtypes.
 - `tickets/eval_seed_labelled.json` is a small labelled seed (15 rows), not ground truth for all 40 public tickets.
