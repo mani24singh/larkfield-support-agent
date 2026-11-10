@@ -24,12 +24,22 @@ from src.ingest import (
     Dataset,
     OrderLineRecord,
     OrderRecord,
+    RefundRecord,
     ShipmentRecord,
     normalise_order_id,
 )
-from src.models import Attachment, Check, CheckResult, Evidence, TicketType
+from src.money import quantize_money
+from src.models import (
+    ApproverRole,
+    Attachment,
+    Check,
+    CheckResult,
+    Evidence,
+    Outcome,
+    TicketType,
+)
 
-CHECK_ORDER: tuple[str, ...] = (
+BASE_CHECK_ORDER: tuple[str, ...] = (
     "POLICY_INTEGRITY",
     "ORDER_IDENTIFIED",
     "CUSTOMER_MATCH",
@@ -38,7 +48,10 @@ CHECK_ORDER: tuple[str, ...] = (
     "DELIVERY_WINDOW",
     "DAMAGE_EVIDENCE",
 )
-"""Check emission order required by the brief; ``build_checks`` follows it."""
+MONEY_CHECK_ORDER: tuple[str, ...] = ("ITEM_SCOPE", "PRIOR_REFUNDS", "AUTHORITY")
+
+CHECK_ORDER: tuple[str, ...] = BASE_CHECK_ORDER + MONEY_CHECK_ORDER
+"""Check emission order required by the brief; ``assess_refund`` follows it."""
 
 POLICY_DOCUMENT = "refund_policy_RP-3.2.md"
 POLICY_VERSION = "3.2"
@@ -838,8 +851,416 @@ def build_checks(
     return checks
 
 
+# ---------------------------------------------------------------------------
+# 7. Money, scope and authority (gates 5-9, RP-3.2 2.2, 2.4, 2.5, 3.1-3.3)
+# ---------------------------------------------------------------------------
+
+_QUANTITY_WORDS: dict[str, int] = {
+    "one": 1,
+    "two": 2,
+    "both": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+_QUANTITY_TOKEN = r"(?:\d{1,3}|one|two|both|three|four|five|six|seven|eight|nine|ten)"
+
+_WHOLE_ORDER_RE = re.compile(
+    r"\b(?:whole|entire|full|complete|total)\s+order\b"
+    r"|\beverything\b"
+    r"|\ball (?:of )?(?:the )?(?:items|order|goods)\b"
+    r"|\ball of it\b",
+    re.IGNORECASE,
+)
+_SHIPPING_RE = re.compile(
+    r"\bshipping\b|\bpostage\b|\bdelivery (?:fee|charge|cost)\b|\bshipping (?:fee|cost|charge)s?\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_AMOUNT_RE = re.compile(r"(?:\$|usd\s*)(\d[\d,]*(?:\.\d{1,2})?)", re.IGNORECASE)
+
+_PRODUCT_STOPWORDS = frozenset(
+    {"set", "pair", "with", "and", "the", "for", "pack", "of", "x"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LineAssessment:
+    """One affected order line: affected quantity and refundable value."""
+
+    order_id: str
+    line_no: int
+    product_name: str
+    ordered_qty: int
+    affected_qty: int
+    unit_price: Decimal
+    gross: Decimal
+    prior_refunded: Decimal
+    eligible: Decimal
+    matched_term: str | None = None
+
+    @property
+    def fully_refunded(self) -> bool:
+        return self.eligible == Decimal("0.00") and self.prior_refunded > Decimal("0.00")
+
+
+@dataclass(frozen=True, slots=True)
+class Decision:
+    """The policy decision for one ticket."""
+
+    outcome: Outcome
+    reason_codes: tuple[ReasonCode, ...]
+    checks: tuple[Check, ...]
+    amount: Decimal
+    approver_role: ApproverRole
+    human_approval_required: bool
+
+
+def _product_keywords(product_name: str) -> tuple[str, ...]:
+    words = re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", product_name.lower())
+    return tuple(
+        word for word in words if len(word) >= 3 and word not in _PRODUCT_STOPWORDS
+    )
+
+
+def _matched_term(body_lower: str, product_name: str) -> str | None:
+    for keyword in _product_keywords(product_name):
+        pattern = re.compile(rf"\b{re.escape(keyword)}s?\b")
+        match = pattern.search(body_lower)
+        if match is not None:
+            return keyword
+    return None
+
+
+def _to_quantity(token: str) -> int | None:
+    cleaned = token.strip().lower()
+    if cleaned.isdigit():
+        return int(cleaned)
+    return _QUANTITY_WORDS.get(cleaned)
+
+
+def _requested_quantity(
+    body_lower: str, keyword: str, ordered_qty: int
+) -> int:
+    """Infer the affected quantity near a product mention, capped by the order."""
+    singular = re.escape(keyword)
+    patterns = (
+        rf"\b(?P<qty>{_QUANTITY_TOKEN})\s+of\s+(?:the\s+|my\s+|your\s+)?"
+        rf"(?:{_QUANTITY_TOKEN}\s+)?{singular}s?\b",
+        rf"\b(?P<qty>{_QUANTITY_TOKEN})\s+{singular}s?\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, body_lower)
+        if match is None:
+            continue
+        quantity = _to_quantity(match.group("qty"))
+        if quantity is not None and quantity > 0:
+            return min(quantity, ordered_qty)
+    return min(1, ordered_qty)
+
+
+def select_affected_lines(
+    *,
+    order: OrderRecord,
+    lines: Sequence[OrderLineRecord],
+    refunds: Sequence[RefundRecord],
+    body: str,
+) -> tuple[LineAssessment, ...]:
+    """Select the affected lines and quantities the customer actually described.
+
+    Only lines that exist on this order can be affected. Product names in the
+    email pick the lines; a single-line order is used as-is. Quantities are
+    capped at the ordered quantity (RP-3.2 2.2, 2.4).
+    """
+    order_lines = [line for line in lines if line.order_id == order.order_id]
+    if not order_lines:
+        return ()
+
+    body_lower = body.lower()
+    whole_order = _WHOLE_ORDER_RE.search(body_lower) is not None
+
+    matched: list[tuple[OrderLineRecord, str]] = []
+    for line in order_lines:
+        term = _matched_term(body_lower, line.product_name)
+        if term is not None:
+            matched.append((line, term))
+
+    if not matched:
+        matched = [(line, None) for line in order_lines]
+
+    issued_by_line: dict[int, Decimal] = {}
+    for refund in refunds:
+        if refund.order_id != order.order_id or refund.status != "ISSUED":
+            continue
+        issued_by_line[refund.line_no] = issued_by_line.get(
+            refund.line_no, Decimal("0.00")
+        ) + refund.amount
+
+    assessments: list[LineAssessment] = []
+    for line, term in matched:
+        if whole_order:
+            affected_qty = line.qty
+        elif term is not None:
+            affected_qty = _requested_quantity(body_lower, term, line.qty)
+        else:
+            affected_qty = min(1, line.qty)
+
+        gross = quantize_money(Decimal(affected_qty) * line.unit_price)
+        prior = quantize_money(issued_by_line.get(line.line_no, Decimal("0.00")))
+        eligible = quantize_money(max(gross - min(prior, gross), Decimal("0.00")))
+
+        assessments.append(
+            LineAssessment(
+                order_id=order.order_id,
+                line_no=line.line_no,
+                product_name=line.product_name,
+                ordered_qty=line.qty,
+                affected_qty=affected_qty,
+                unit_price=line.unit_price,
+                gross=gross,
+                prior_refunded=prior,
+                eligible=eligible,
+                matched_term=term,
+            )
+        )
+
+    return tuple(assessments)
+
+
+def _asked_beyond_eligible(
+    *,
+    body: str,
+    order: OrderRecord,
+    affected: Sequence[LineAssessment],
+    amount: Decimal,
+    line_count: int,
+) -> str | None:
+    """Return the phrase showing the customer asked for more than is eligible."""
+    whole_match = _WHOLE_ORDER_RE.search(body)
+    affects_everything = (
+        len(affected) == line_count
+        and all(item.affected_qty == item.ordered_qty for item in affected)
+    )
+
+    if whole_match is not None and not affects_everything:
+        return whole_match.group(0)
+
+    shipping_match = _SHIPPING_RE.search(body)
+    if shipping_match is not None and order.shipping_fee > Decimal("0.00"):
+        return shipping_match.group(0)
+
+    explicit = _EXPLICIT_AMOUNT_RE.search(body)
+    if explicit is not None:
+        requested = quantize_money(Decimal(explicit.group(1).replace(",", "")))
+        if requested > amount:
+            return explicit.group(0)
+
+    return None
+
+
+def _money_checks(
+    *,
+    order: OrderRecord,
+    affected: Sequence[LineAssessment],
+    amount: Decimal,
+    asked_beyond: str | None,
+    approval_required: bool,
+    limit: Decimal,
+    fully_refunded: bool,
+    prior_refunds: Sequence[RefundRecord],
+) -> list[Check]:
+    scope_evidence: list[Evidence] = [
+        Evidence(
+            source="order_items.csv",
+            ref=f"{item.order_id}#{item.line_no}",
+            value=(
+                f"{item.product_name}: affected {item.affected_qty} of {item.ordered_qty}"
+                f" @ {item.unit_price} = {item.gross}"
+            ),
+        )
+        for item in affected
+    ]
+    if asked_beyond is not None:
+        scope_evidence.append(
+            Evidence(source="email:body", ref="scope-request", value=asked_beyond)
+        )
+    if order.shipping_fee > Decimal("0.00"):
+        scope_evidence.append(
+            Evidence(
+                source="orders.csv",
+                ref=order.order_id,
+                value=f"shipping {order.shipping_fee} is not refundable",
+            )
+        )
+
+    checks: list[Check] = [
+        _check(
+            "ITEM_SCOPE",
+            "PASS" if affected else "FAIL",
+            "2.4" if asked_beyond is not None else "2.2",
+            scope_evidence,
+        )
+    ]
+
+    prior_evidence: list[Evidence] = [
+        Evidence(
+            source="refunds.csv",
+            ref=refund.refund_id,
+            value=f"line {refund.line_no}: {refund.amount} {refund.status}",
+        )
+        for refund in prior_refunds
+        if refund.status == "ISSUED"
+    ]
+    prior_evidence.append(
+        Evidence(
+            source="refunds.csv",
+            ref=order.order_id,
+            value=f"remaining eligible value {amount}",
+        )
+    )
+    checks.append(
+        _check(
+            "PRIOR_REFUNDS",
+            "NOT_APPLICABLE"
+            if not prior_evidence[:-1]
+            else ("FAIL" if fully_refunded else "PASS"),
+            "2.5",
+            prior_evidence,
+        )
+    )
+
+    checks.append(
+        _check(
+            "AUTHORITY",
+            "FAIL" if approval_required else "PASS",
+            "3.2" if approval_required else "3.1",
+            (
+                Evidence(
+                    source="policy:RP-3.2",
+                    ref="3.1-3.2",
+                    value=f"amount {amount} vs threshold {limit}",
+                ),
+                Evidence(
+                    source="decision",
+                    ref="approval",
+                    value="SUPPORT_LEAD required"
+                    if approval_required
+                    else "no approval required",
+                ),
+            ),
+        )
+    )
+
+    return checks
+
+
+def assess_refund(
+    *,
+    order: OrderRecord,
+    lines: Sequence[OrderLineRecord],
+    refunds: Sequence[RefundRecord],
+    body: str,
+    base_checks: Sequence[Check] = (),
+    settings: Settings | None = None,
+) -> Decision:
+    """Compute affected-line money and authority, returning the full decision.
+
+    The amount is always the eligible unpaid value of the affected lines only:
+    prior ISSUED refunds are deducted per line, shipping is never refunded, and
+    a request for more than that is reduced rather than honoured (RP-3.2 2.2,
+    2.4, 2.5). Amounts above the auto-approval limit are pended for a Support
+    Lead (3.1, 3.2); exactly at the limit still proceeds.
+    """
+    config = settings or Settings()
+    limit = config.refund_auto_approve_limit_usd
+
+    affected = select_affected_lines(
+        order=order, lines=lines, refunds=refunds, body=body
+    )
+    amount = quantize_money(
+        sum((item.eligible for item in affected), Decimal("0.00"))
+    )
+
+    prior_refunds = tuple(
+        refund
+        for refund in refunds
+        if refund.status == "ISSUED"
+        and refund.order_id == order.order_id
+        and any(refund.line_no == item.line_no for item in affected)
+    )
+    fully_refunded = bool(affected) and amount == Decimal("0.00") and bool(prior_refunds)
+
+    order_line_count = sum(1 for line in lines if line.order_id == order.order_id)
+    asked_beyond = _asked_beyond_eligible(
+        body=body,
+        order=order,
+        affected=affected,
+        amount=amount,
+        line_count=order_line_count,
+    )
+
+    approval_required = amount > limit
+
+    reasons: list[ReasonCode] = []
+    if fully_refunded:
+        outcome: Outcome = "REJECT"
+        reasons.append(ReasonCode.ALREADY_REFUNDED)
+    else:
+        if prior_refunds:
+            reasons.append(ReasonCode.ALREADY_REFUNDED)
+        if asked_beyond is not None:
+            reasons.append(ReasonCode.PARTIAL_LINES)
+        if approval_required:
+            reasons.append(ReasonCode.APPROVAL_REQUIRED)
+            outcome = "PEND"
+        elif asked_beyond is not None:
+            outcome = "PROCEED_MODIFIED"
+        else:
+            outcome = "PROCEED"
+
+    money_checks = _money_checks(
+        order=order,
+        affected=affected,
+        amount=amount,
+        asked_beyond=asked_beyond,
+        approval_required=approval_required,
+        limit=limit,
+        fully_refunded=fully_refunded,
+        prior_refunds=prior_refunds,
+    )
+
+    checks = _ordered_checks([*base_checks, *money_checks])
+
+    return Decision(
+        outcome=outcome,
+        reason_codes=tuple(dict.fromkeys(reasons)),
+        checks=checks,
+        amount=amount,
+        approver_role="SUPPORT_LEAD" if approval_required else None,
+        human_approval_required=approval_required,
+    )
+
+
+def _ordered_checks(checks: Sequence[Check]) -> tuple[Check, ...]:
+    """Return checks in the mandated order, rejecting unknown check ids."""
+    known = {check_id: index for index, check_id in enumerate(CHECK_ORDER)}
+    for check in checks:
+        if check.check_id not in known:
+            raise ValueError(f"unknown check_id: {check.check_id}")
+    return tuple(sorted(checks, key=lambda check: known[check.check_id]))
+
+
 def refundable_amount(
     lines: Sequence[OrderLineRecord], requested_qty: int
 ) -> Decimal:
     """Return the affected-line value for the requested, capped quantity."""
-    raise NotImplementedError("line-level money rules land with the second half")
+    total = Decimal("0.00")
+    for line in lines:
+        quantity = min(max(requested_qty, 0), line.qty)
+        total += Decimal(quantity) * line.unit_price
+    return quantize_money(total)
+

@@ -14,7 +14,7 @@ from src.ingest import (
 )
 from src.models import Attachment, CheckResult
 from src.policy import (
-    CHECK_ORDER,
+    BASE_CHECK_ORDER,
     CarrierState,
     DamageEvidence,
     IdentityStatus,
@@ -582,7 +582,7 @@ def test_checks_are_emitted_in_the_required_order(dataset: Dataset, owned_order)
 
     checks = _checks(identity=identity, carrier=carrier, window=window, damage=damage)
 
-    assert [check.check_id for check in checks] == list(CHECK_ORDER)
+    assert [check.check_id for check in checks] == list(BASE_CHECK_ORDER)
 
 
 def test_every_check_carries_clause_and_evidence(dataset: Dataset, owned_order) -> None:
