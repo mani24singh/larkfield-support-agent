@@ -94,6 +94,19 @@ uvicorn src.solution:app --host 0.0.0.0 --port $PORT
    curl -s https://<your-service>.onrender.com/healthz
    ```
 
+If Render ever reports `Attribute "app" not found in module "src.solution"`,
+the service has built an older commit: the original scaffold only defined
+`main()`. Redeploy the latest `main`. On current code `src/solution.py` exports
+the single FastAPI instance as `app`, and the Render **Start Command** (only
+needed if you override the Docker CMD) must be:
+
+```bash
+uvicorn src.solution:app --host 0.0.0.0 --port $PORT
+```
+
+Keep the **Root Directory** at the repository root so `src.solution` is
+importable; do not point it at `src/`.
+
 ### Railway
 
 1. Push this repository to GitHub.
