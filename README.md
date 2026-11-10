@@ -1,50 +1,71 @@
-# F1 Capstone Template
+# Larkfield Home support agent
 
-Starter repository for the Cadra F1 walking-skeleton capstone. Use OpenCode with the Cadra provider to build your solution, document your approach, and submit a public GitHub repo for evaluation.
+A FastAPI service that reads a Larkfield Home customer support email and returns
+a structured, schema-valid decision: ticket type, resolved order and customer,
+outcome, reason codes, per-check evidence, approval requirement, draft reply and
+trace.
 
-## Prerequisites
+It is proposal-only. It never issues a refund, sends an email or changes an
+order; financial actions are recorded in an append-only ledger and wait for a
+human decision where RP-3.2 requires one.
 
-- Python 3.11+
-- [OpenCode](https://opencode.ai) ≥ 1.17.0
-- A Cadra JWT (`CADRA_TOKEN`) from the F1 Setup page
-- Your Cadra proxy URL (from the F1 Setup page)
+## What it does
 
-## Setup
+- Matches the sender and order against the supplied CRM, order, shipment and
+  refund data. Order references in five common formats resolve to `LF-######`;
+  an unknown or near-miss reference is never mapped to a nearby order.
+- Applies **RP-3.2** (version 3.2) in a fixed order: safety, identity, carrier,
+  delivery window, affected lines, prior refunds, refund amount, modification,
+  authority and idempotency.
+- Refunds only affected lines, at affected quantity × unit price, in `Decimal`,
+  excluding shipping, deducting refunds already `ISSUED`, and pends anything
+  above $150.00 for a Support Lead. Exactly $150.00 proceeds.
+- Escalates policy-override attempts to Trust & Safety and lost-in-transit
+  parcels to Carrier Claims; treats unverifiable carrier statuses as
+  unverifiable rather than as a denial.
+- Writes responses and ledger rows atomically under `runs/<run_id>/`.
+- Uses an OpenAI-compatible Cadra model **only** for advisory extraction and
+  reply wording. With no key configured it writes replies from deterministic
+  templates; either way the decision and money never change.
 
-1. Clone this repo (or use it as a GitHub template).
-2. Set the environment variables (both values come from the F1 Setup page):
-   ```bash
-   export CADRA_PROXY_URL=<your-proxy-url>   # e.g. https://your-proxy.example.com/v1
-   export CADRA_TOKEN=<your-cadra-jwt>
-   ```
-   `opencode.json` reads both via `{env:…}` — no file edits needed.
-3. Install OpenCode if not already installed (see [opencode.ai](https://opencode.ai)).
-4. Run OpenCode in this directory:
-   ```bash
-   opencode
-   ```
-5. Complete `APPROACH.md` and implement your solution in `src/` (start with `src/solution.py`).
-6. Push your work to a **public** GitHub repository.
-7. Submit your repo URL on the F1 demo page.
-
-## Python environment (optional)
+## Quick start
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+
+export PORT=8000                 # Windows PowerShell: $env:PORT=8000
+uvicorn src.solution:app --host 0.0.0.0 --port "${PORT:-8000}"
 ```
 
-## Run the service
+The application instance is exported directly by `src/solution.py` as `app`; it
+is built by the `create_app()` factory in `src/api.py`. `python -m src.solution`
+starts the same instance.
 
 ```bash
-export PORT=8000
-uvicorn src.solution:app --host 0.0.0.0 --port "${PORT:-8000}"
-# or: python -m src.solution
+curl -s localhost:8000/health
+# {"status":"ok"}
 ```
 
-Health probes: `GET /health` and `GET /healthz` both return `{"status":"ok"}`.
-Interactive API docs are at `/docs`. Submit one ticket with:
+Configuration is environment-only. Copy `.env.example` for the full list; no
+secrets are committed. `CADRA_TOKEN` and `CADRA_PROXY_URL` are optional and only
+enable model-drafted replies. Policy thresholds, data paths, run directory and
+the per-million-token price table are all settable there.
+
+## Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health`, `/healthz` | Liveness: `{"status":"ok"}` |
+| POST | `/tickets` | One ticket object or a list; returns a list of `TicketResponse` |
+| GET | `/runs/{run_id}` | Responses and ledger for a run |
+| POST | `/approvals` | Approve or reject a pending action |
+| POST | `/runs/{run_id}/decision` | Alias for `/approvals` with `run_id` in the path |
+| GET | `/ledger?run_id=` | Ledger entries for a run (all runs if omitted) |
+| GET | `/docs` | Interactive OpenAPI documentation |
+
+Submit one ticket:
 
 ```bash
 curl -s -X POST localhost:8000/tickets \
@@ -52,12 +73,56 @@ curl -s -X POST localhost:8000/tickets \
   -d "$(python -c "import json;print(json.dumps(json.load(open('inbox/public_tickets.json'))[0]))")"
 ```
 
-## Deploy
+Submit a batch (one run id for the whole batch, processed in input order):
 
-The container is self-contained: Python 3.11 slim, non-root `app` user, uvicorn
-bound to `0.0.0.0:$PORT`. No secrets are baked into the image — provide
-`CADRA_TOKEN` (and the rest) as platform environment variables. `PORT` is
-injected by the platform; do not hard-code it in production.
+```bash
+curl -s -X POST localhost:8000/tickets \
+  -H 'content-type: application/json' \
+  -d @inbox/public_tickets.json
+```
+
+Inspect the run:
+
+```bash
+curl -s localhost:8000/runs/<run_id>
+curl -s "localhost:8000/ledger?run_id=<run_id>"
+```
+
+Approve or reject. Only `PEND` and `ESCALATE` tickets are approvable; repeating
+the same decision returns 200 without creating a second action; the opposite
+decision or a non-approvable outcome returns 409.
+
+```bash
+curl -s -X POST "localhost:8000/approvals?run_id=<run_id>&ticket_id=T003" \
+  -H 'content-type: application/json' \
+  -d '{"decision":"approve","approver":"lead@larkfield.example"}'
+```
+
+## Tests and evaluation
+
+```bash
+pytest -q
+```
+
+The suite covers ingest normalisation and duplicate collapsing, policy gates,
+money and authority boundaries, injection and duplicate handling, schema
+validation of all 40 public tickets, determinism and the HTTP API.
+
+```bash
+python eval/run_eval.py
+```
+
+The evaluation runs all 40 public tickets, validates every response against
+`schema/response_schema.py`, compares the 15 labelled tickets from
+`tickets/eval_seed_labelled.json`, checks determinism across two passes and
+replays the batch for refund idempotency. It writes `reports/eval_report.md`
+with headline metrics, a failure list and a per-ticket table, and exits non-zero
+if anything fails. The reconciliation of every proposed refund is in
+`ARTEFACT.md`.
+
+## Deployment
+
+Docker:
 
 ```bash
 docker build -t larkfield-support-agent .
@@ -65,77 +130,48 @@ docker run --rm -p 8000:8000 \
   -e CADRA_TOKEN=<your-cadra-jwt> \
   -e CADRA_PROXY_URL=<your-proxy-url> \
   larkfield-support-agent
-curl -s localhost:8000/healthz     # {"status":"ok"}
+curl -s localhost:8000/healthz
 ```
 
-Start command (any platform that can run uvicorn directly):
+The image is Python 3.11 slim, runs as an unprivileged `app` user, reads all
+configuration from the environment, and starts uvicorn on `$PORT`. The portable
+start command is:
 
 ```bash
 uvicorn src.solution:app --host 0.0.0.0 --port $PORT
 ```
 
-### Render
+**Render.** Push to GitHub, create a **Web Service**, choose **Docker**, set
+**Dockerfile Path** `./Dockerfile` and **Build Context** `.`, set **Health Check
+Path** `/healthz`, and add `CADRA_PROXY_URL`, `CADRA_TOKEN` (as a secret),
+`CADRA_MODEL` and the policy thresholds as environment variables. Do not set
+`PORT`; Render injects it. Deploy and check
+`https://<service>.onrender.com/healthz`. Keep the Root Directory at the
+repository root.
 
-1. Push this repository to GitHub.
-2. In the Render dashboard choose **New + → Web Service** and connect the repo.
-3. Set **Language** to `Docker`. **Dockerfile Path** `./Dockerfile`, **Docker
-   Build Context** `.` (repository root).
-4. Set **Health Check Path** to `/healthz`.
-5. Open **Environment** and add:
-   - `CADRA_PROXY_URL` — your Cadra proxy base URL (e.g. `https://…/v1`)
-   - `CADRA_TOKEN` — your Cadra JWT (mark it as a secret)
-   - `CADRA_MODEL` — `cadra/cadra`
-   - `REFUND_AUTO_APPROVE_LIMIT_USD=150.00`
-   - `RETURN_WINDOW_DAYS=30`, `DAMAGE_WINDOW_DAYS=45`, `LOST_IN_TRANSIT_DAYS=10`
-   - optional: `CADRA_INPUT_COST_PER_MTOK`, `CADRA_OUTPUT_COST_PER_MTOK`
-   - do **not** set `PORT`; Render injects it and the Dockerfile honours it.
-6. Click **Create Web Service**, wait for the health check to pass, then:
-   ```bash
-   curl -s https://<your-service>.onrender.com/healthz
-   ```
+**Railway.** Create a project from the repo or run `railway up`; Railway detects
+the Dockerfile. Add the same variables under **Variables** (not `PORT`), then
+**Settings → Networking → Generate Domain** and check
+`https://<domain>.up.railway.app/healthz`.
 
-If Render ever reports `Attribute "app" not found in module "src.solution"`,
-the service has built an older commit: the original scaffold only defined
-`main()`. Redeploy the latest `main`. On current code `src/solution.py` exports
-the single FastAPI instance as `app`, and the Render **Start Command** (only
-needed if you override the Docker CMD) must be:
+Both platforms must build the current `main`. `src/solution.py` exports the
+single FastAPI instance as `app`; an `Attribute "app" not found` error means the
+platform is building an older commit whose stub only defined `main()`.
 
-```bash
-uvicorn src.solution:app --host 0.0.0.0 --port $PORT
-```
+## Results
 
-Keep the **Root Directory** at the repository root so `src.solution` is
-importable; do not point it at `src/`.
+From `reports/eval_report.md` on 10 November 2026:
 
-### Railway
+- 40/40 responses are schema-valid.
+- 15/15 labelled tickets match the senior-agent outcome, approval, approver
+  role, amount and reason-code set.
+- 40/40 decisions are identical across two independent passes.
+- Replay is idempotent: 16 refund actions on the first pass and 16 on the
+  repeat; duplicates T027/T028 produce no second action.
+- 16 refunds totalling $1,557.50 were proposed, with no line refunded twice and
+  no amount above its affected value (`ARTEFACT.md` §4).
+- The run took about 0.6 seconds and used $0.0000 of model cost because no Cadra
+  key was configured; replies came from the deterministic templates.
 
-1. Push this repository to GitHub.
-2. Create a project: **New Project → Deploy from GitHub repo**, or from the CLI
-   run `railway login` then `railway init` in the repository root and
-   `railway up`.
-3. Railway detects the `Dockerfile` automatically. If it does not, open
-   **Settings → Build** and set the Dockerfile path to `Dockerfile`.
-4. Open **Variables** and add the same variables as above (`CADRA_PROXY_URL`,
-   `CADRA_TOKEN`, `CADRA_MODEL`, the policy thresholds, optional price table).
-   Do **not** set `PORT`; Railway injects it and the start command uses it.
-5. Under **Settings → Networking**, click **Generate Domain**. Railway routes
-   to the container's `$PORT` automatically.
-6. After the deployment is live:
-   ```bash
-   curl -s https://<your-domain>.up.railway.app/healthz
-   ```
-
-Both platforms keep the endpoint public and unauthenticated, as the brief
-requires. Rotate `CADRA_TOKEN` in the platform dashboard if it is ever exposed.
-
-## Project layout
-
-```
-.
-├── opencode.json    # Cadra provider config (reads CADRA_PROXY_URL + CADRA_TOKEN from env)
-├── APPROACH.md      # Your written approach (required for submission)
-├── src/
-│   └── solution.py  # Your solution code
-├── requirements.txt
-└── README.md
-```
+The evaluation is rule-based on 40 public tickets, 15 of which are labelled. A
+live-model run and a larger labelled set are the main outstanding measurements.
