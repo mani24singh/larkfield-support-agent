@@ -1,0 +1,30 @@
+# VCS and local tooling
+.git
+.gitignore
+.github
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Secrets and local state must never enter the image or build cache
+.env
+.env.*
+!.env.example
+runs/
+reports/
+*.log
+
+# Not needed at runtime
+tests/
+eval/
+AGENTS.md
+APPROACH.md
+ARTEFACT.md
+ARTEFACT.html
+CONTRACT.md
+DATA_DICTIONARY.md
+opencode.json
